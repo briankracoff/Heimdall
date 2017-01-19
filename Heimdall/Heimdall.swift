@@ -34,6 +34,7 @@
 //
 
 import Foundation
+import LocalAuthentication
 import Security
 import CommonCrypto
 
@@ -42,6 +43,7 @@ open class Heimdall {
     fileprivate var privateTag: String?
     fileprivate var scope: ScopeOptions
     fileprivate var accessibility: KeypairAccessibility
+    fileprivate let context: LAContext?
 
     ///
     /// Create an instance with data for the public key,
@@ -54,7 +56,7 @@ open class Heimdall {
     ///
     /// - returns: Heimdall instance that can handle only public key operations
     ///
-    public convenience init?(publicTag: String, publicKeyData: Data? = nil, accessibility: KeypairAccessibility = .WhenUnlocked) {
+    public convenience init?(publicTag: String, publicKeyData: Data? = nil, accessibility: KeypairAccessibility = .WhenUnlocked, context: LAContext? = nil) {
         if let existingData = Heimdall.obtainKeyData(publicTag) {
             // Compare agains the new data (optional)
             if let newData = publicKeyData?.dataByStrippingX509Header() , (existingData != newData) {
@@ -64,13 +66,13 @@ open class Heimdall {
                 }
             }
             
-            self.init(scope: ScopeOptions.PublicKey, publicTag: publicTag, privateTag: nil, accessibility: accessibility)
-        } else if let data = publicKeyData?.dataByStrippingX509Header(), let _ = Heimdall.insertPublicKey(publicTag, accessibility: accessibility, data: data) {
+            self.init(scope: ScopeOptions.PublicKey, publicTag: publicTag, privateTag: nil, accessibility: accessibility, context: context)
+        } else if let data = publicKeyData?.dataByStrippingX509Header(), let _ = Heimdall.insertPublicKey(publicTag, accessibility: accessibility, context: context, data: data) {
             // Successfully created the new key
-            self.init(scope: ScopeOptions.PublicKey, publicTag: publicTag, privateTag: nil, accessibility: accessibility)
+            self.init(scope: ScopeOptions.PublicKey, publicTag: publicTag, privateTag: nil, accessibility: accessibility, context: context)
         } else {
             // Call the init, although returning nil
-            self.init(scope: ScopeOptions.PublicKey, publicTag: publicTag, privateTag: nil, accessibility: accessibility)
+            self.init(scope: ScopeOptions.PublicKey, publicTag: publicTag, privateTag: nil, accessibility: accessibility, context: context)
             return nil
         }
     }
@@ -102,8 +104,8 @@ open class Heimdall {
     ///
     /// - returns: Heimdall instance that can handle both private and public key operations
     ///
-    public convenience init?(tagPrefix: String, keySize: Int = 2048, accessibility: KeypairAccessibility = .WhenUnlocked) {
-        self.init(publicTag: tagPrefix, privateTag: tagPrefix + ".private", keySize: keySize, accessibility: accessibility)
+    public convenience init?(tagPrefix: String, keySize: Int = 2048, accessibility: KeypairAccessibility = .WhenUnlocked, context: LAContext? = nil) {
+        self.init(publicTag: tagPrefix, privateTag: tagPrefix + ".private", keySize: keySize, accessibility: accessibility, context: context)
     }
     
     ///
@@ -117,22 +119,22 @@ open class Heimdall {
     ///
     /// - returns: Heimdall instance ready for both public and private key operations
     ///
-    public convenience init?(publicTag: String, privateTag: String, keySize: Int = 2048, accessibility: KeypairAccessibility = .WhenUnlocked) {
-        self.init(scope: ScopeOptions.All, publicTag: publicTag, privateTag: privateTag, accessibility: accessibility)
+    public convenience init?(publicTag: String, privateTag: String, keySize: Int = 2048, accessibility: KeypairAccessibility = .WhenUnlocked, context: LAContext? = nil) {
+        self.init(scope: ScopeOptions.All, publicTag: publicTag, privateTag: privateTag, accessibility: accessibility, context: context)
         
         if Heimdall.obtainKey(publicTag) == nil || Heimdall.obtainKey(privateTag) == nil {
-            if Heimdall.generateKeyPair(publicTag, privateTag: privateTag, keySize: keySize, accessibility: accessibility) == nil {
+            if Heimdall.generateKeyPair(publicTag, privateTag: privateTag, keySize: keySize, accessibility: accessibility, context: context) == nil {
                 return nil
             }
         }
     }
     
-    fileprivate init(scope: ScopeOptions, publicTag: String, privateTag: String?, accessibility: KeypairAccessibility) {
+    fileprivate init(scope: ScopeOptions, publicTag: String, privateTag: String?, accessibility: KeypairAccessibility, context: LAContext?) {
         self.publicTag = publicTag
         self.privateTag = privateTag
         self.scope = scope
         self.accessibility = accessibility
-      
+        self.context = context
     }
     
     //
@@ -499,7 +501,7 @@ open class Heimdall {
         }
         
         if let privateTag = self.privateTag , self.destroy() {
-            if Heimdall.generateKeyPair(self.publicTag, privateTag: privateTag, keySize: keySize, accessibility: accessibility) != nil {
+            if Heimdall.generateKeyPair(self.publicTag, privateTag: privateTag, keySize: keySize, accessibility: accessibility, context: self.context) != nil {
                 // Restore our scope back to .All
                 self.scope = .All
                 return true
@@ -625,7 +627,7 @@ open class Heimdall {
         return SecItemDelete(query as CFDictionary) == noErr
     }
 
-    fileprivate class func insertPublicKey(_ publicTag: String, accessibility: KeypairAccessibility, data: Data) -> SecKey? {
+    fileprivate class func insertPublicKey(_ publicTag: String, accessibility: KeypairAccessibility, context: LAContext?, data: Data) -> SecKey? {
         var publicAttributes = Dictionary<String, AnyObject>()
         publicAttributes[String(kSecAttrKeyType)] = kSecAttrKeyTypeRSA
         publicAttributes[String(kSecClass)] = kSecClassKey as CFString
@@ -633,6 +635,12 @@ open class Heimdall {
         publicAttributes[String(kSecValueData)] = data as CFData
         publicAttributes[String(kSecReturnPersistentRef)] = true as CFBoolean
         publicAttributes[String(kSecAttrAccessible)] = accessibility.accessibilityConstant as CFString
+
+        if #available(iOS 9, *) {
+            if let context = context {
+                publicAttributes[String(kSecUseAuthenticationContext)] = context
+            }
+        }
 
         var persistentRef: AnyObject?
         let status = SecItemAdd(publicAttributes as CFDictionary, &persistentRef)
@@ -645,17 +653,23 @@ open class Heimdall {
     }
     
 
-    fileprivate class func generateKeyPair(_ publicTag: String, privateTag: String, keySize: Int, accessibility: KeypairAccessibility) -> (publicKey: SecKey, privateKey: SecKey)? {
+    fileprivate class func generateKeyPair(_ publicTag: String, privateTag: String, keySize: Int, accessibility: KeypairAccessibility, context: LAContext?) -> (publicKey: SecKey, privateKey: SecKey)? {
         let privateAttributes = [String(kSecAttrIsPermanent): true,
                                  String(kSecAttrApplicationTag): privateTag] as [String : Any]
         let publicAttributes = [String(kSecAttrIsPermanent): true,
                                 String(kSecAttrApplicationTag): publicTag] as [String : Any]
         
-        let pairAttributes = [String(kSecAttrKeyType): kSecAttrKeyTypeRSA,
+        var pairAttributes = [String(kSecAttrKeyType): kSecAttrKeyTypeRSA,
                               String(kSecAttrKeySizeInBits): keySize,
                               String(kSecPublicKeyAttrs): publicAttributes,
                               String(kSecPrivateKeyAttrs): privateAttributes,
                               String(kSecAttrAccessible): accessibility.accessibilityConstant] as [String : Any]
+
+        if #available(iOS 9, *) {
+            if let context = context {
+                pairAttributes[String(kSecUseAuthenticationContext)] = context
+            }
+        }
 
         var publicRef: SecKey?
         var privateRef: SecKey?
